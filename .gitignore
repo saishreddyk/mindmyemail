@@ -1,3 +1,5 @@
 *.json
 *.env
 .venv/*
+*.pyc
+last_executed_date.txt
