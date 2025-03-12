@@ -29,10 +29,16 @@ def authenticate_gmail():
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                logger.error(f"Error refreshing token: {e}")
+                logger.info("Deleting token.json to re-authenticate")
+                os.remove("token.json")
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    "credentials.json", SCOPES
+                )
+                creds = flow.run_local_server(port=0)
         with open("token.json", "w") as token:
             token.write(creds.to_json())
     return build("gmail", "v1", credentials=creds)
@@ -43,40 +49,53 @@ def get_emails(service, start_timestamp):
     start_date = datetime.fromtimestamp(start_timestamp).strftime("%Y/%m/%d")
     start_time = datetime.fromtimestamp(start_timestamp).strftime("%H:%M:%S")
     logger.info(f"Fetching emails after date: {start_date} {start_time}")
-    
+
     messages = []
     page_token = None
-    
+
     while True:
         results = (
-            service.users().messages().list(
+            service.users()
+            .messages()
+            .list(
                 userId="me",
                 q=f"after:{start_date}",  # Dynamic date-time query
                 pageToken=page_token,
-            ).execute()
+            )
+            .execute()
         )
         if "messages" in results:
             messages.extend(results["messages"])
         page_token = results.get("nextPageToken")
         if not page_token:
             break
-    
+
     if not messages:
         logger.info("No messages found in initial query")
         return []
 
-    logger.info(f"Found {len(messages)} messages in initial query, filtering by timestamp {start_timestamp}")
-    
+    logger.info(
+        f"Found {len(messages)} messages in initial query, filtering by timestamp {start_timestamp}"
+    )
+
     filtered_messages = []
     for msg in messages:
-        msg_details = service.users().messages().get(userId="me", id=msg["id"]).execute()
-        internal_timestamp = int(msg_details["internalDate"]) / 1000  # Convert from milliseconds to seconds
+        msg_details = (
+            service.users().messages().get(userId="me", id=msg["id"]).execute()
+        )
+        internal_timestamp = (
+            int(msg_details["internalDate"]) / 1000
+        )  # Convert from milliseconds to seconds
         if internal_timestamp >= start_timestamp:
             filtered_messages.append(msg_details)
-            logger.debug(f"Including message from {datetime.fromtimestamp(internal_timestamp)}")
+            logger.debug(
+                f"Including message from {datetime.fromtimestamp(internal_timestamp)}"
+            )
         else:
-            logger.debug(f"Excluding message from {datetime.fromtimestamp(internal_timestamp)}")
-    
+            logger.debug(
+                f"Excluding message from {datetime.fromtimestamp(internal_timestamp)}"
+            )
+
     logger.info(f"After timestamp filtering: {len(filtered_messages)} messages remain")
     return filtered_messages
 
@@ -190,7 +209,9 @@ def last_executed_timestamp():
             return float(f.read().strip())
     except (FileNotFoundError, ValueError):
         # Return current timestamp if file doesn't exist or has invalid format
-        logger.warning("File 'last_executed_date.txt' not found or invalid. Using current timestamp.")
+        logger.warning(
+            "File 'last_executed_date.txt' not found or invalid. Using current timestamp."
+        )
         return datetime.now().timestamp()
 
 
@@ -203,8 +224,10 @@ def format_timestamp(timestamp):
 def main():
     service = authenticate_gmail()
     last_timestamp = last_executed_timestamp()
-    logger.info(f"Starting email fetch. Last execution timestamp: {format_timestamp(last_timestamp)}")
-    
+    logger.info(
+        f"Starting email fetch. Last execution timestamp: {format_timestamp(last_timestamp)}"
+    )
+
     emails = get_emails(service, last_timestamp)
     logger.info(f"Found {len(emails)} new emails after timestamp filtering")
 
@@ -214,7 +237,9 @@ def main():
         current_timestamp = datetime.now().timestamp()
         with open("last_executed_date.txt", "w") as f:
             f.write(str(current_timestamp))
-        logger.info(f"Updated last executed timestamp to: {format_timestamp(current_timestamp)}")
+        logger.info(
+            f"Updated last executed timestamp to: {format_timestamp(current_timestamp)}"
+        )
         return
 
     for msg in emails:
@@ -235,7 +260,9 @@ def main():
     current_timestamp = datetime.now().timestamp()
     with open("last_executed_date.txt", "w") as f:
         f.write(str(current_timestamp))
-    logger.info("Updating last executed date to: " + format_timestamp(current_timestamp))
+    logger.info(
+        "Updating last executed date to: " + format_timestamp(current_timestamp)
+    )
     logger.info("Program executed successfully.")
 
 
