@@ -9,6 +9,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+import time
 
 from logger_config import setup_logger
 
@@ -27,7 +28,7 @@ def authenticate_gmail():
     creds = None
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-    
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
@@ -36,15 +37,15 @@ def authenticate_gmail():
                 creds = None
                 if os.path.exists("token.json"):
                     os.remove("token.json")
-        
+
         if not creds:
             flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
             creds = flow.run_local_server(port=0)
-            
+
         # Save the credentials for the next run
         with open("token.json", "w") as token:
             token.write(creds.to_json())
-            
+
     return build("gmail", "v1", credentials=creds)
 
 
@@ -246,7 +247,7 @@ def main():
         )
         return
 
-    for msg in emails:
+    for idx, msg in enumerate(emails):
         msg_id = msg["id"]
         subject, content = get_email_content(service, msg_id)
 
@@ -260,6 +261,9 @@ def main():
         )
         if about_job:
             apply_label(service, msg_id, f"Jobs/{label}")
+
+        if idx % 100 == 0:
+            time.sleep(10)
 
     current_timestamp = datetime.now().timestamp()
     with open("last_executed_date.txt", "w") as f:
