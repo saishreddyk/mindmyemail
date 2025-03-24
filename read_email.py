@@ -263,7 +263,7 @@ def main():
             apply_label(service, msg_id, f"Jobs/{label}")
 
         if idx % 100 == 0:
-            time.sleep(10)
+            time.sleep(60)
 
     current_timestamp = datetime.now().timestamp()
     with open("last_executed_date.txt", "w") as f:
