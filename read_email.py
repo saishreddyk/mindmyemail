@@ -136,13 +136,8 @@ def get_email_content(service, msg_id):
     return subject, ""
 
 
-# --- Analyze Email with OpenAI GPT ---
-def analyze_email_with_llm(content):
-    # Truncate content to approximately 12000 characters (roughly 3000-4000 tokens)
-    # This leaves room for the prompt and other message content
-    truncated_content = content[:22000] + "..."
-
-    prompt = f"Read the following email and determine if it's about a job I might have applied. If yes, just say Yes, else No.\n\nEmail Content:\n{truncated_content}\n\nAnswer:"
+def autolabel_openai(content):
+    prompt = f"Read the following email and determine if it's about a job I might have applied. If yes, just say Yes, else No.\n\nEmail Content:\n{content}\n\nAnswer:"
     response = openai.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
@@ -153,7 +148,7 @@ def analyze_email_with_llm(content):
 
     label = None
     if about_job:
-        prompt = f"Read the email and label it among ['Applied', 'Holding', 'Assessment', 'Interview', 'Offer', 'Rejected', 'Other']. These indicate the status of the job application, if you think this is not a job application status mail label is other. \n\nEmail Content:\n{truncated_content}\n\nLabel (just select label, nothing else):"
+        prompt = f"Read the email and label it among ['Applied', 'Holding', 'Assessment', 'Interview', 'Offer', 'Rejected', 'Other']. These indicate the status of the job application, if you think this is not a job application status mail label is other. \n\nEmail Content:\n{content}\n\nLabel (just select label, nothing else):"
         response = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
@@ -161,6 +156,28 @@ def analyze_email_with_llm(content):
             temperature=0.2,
         )
         label = response.choices[0].message.content.strip()
+
+    return [about_job, label]
+
+
+def analyze_email_with_llm(content):
+    # Truncate content to approximately 12000 characters (roughly 3000-4000 tokens)
+    # This leaves room for the prompt and other message content
+    truncated_content = content[:22000] + "..."
+
+    try:
+        about_job, label = autolabel_openai(truncated_content)
+    except Exception as e:
+        logger.error(f"OpenAI API Error: {e}")
+        try:
+            logger.info("Waiting for a minute before retrying...")
+            time.sleep(60)
+            about_job, label = autolabel_openai(truncated_content)
+        except Exception as e:
+            logger.error(f"OpenAI API Error: {e}")
+            logger.error("Something went wrong with OpenAI API. Exiting...")
+            exit(1)
+
     return [about_job, label]
 
 
@@ -247,7 +264,7 @@ def main():
         )
         return
 
-    for idx, msg in enumerate(emails):
+    for msg in enumerate(emails):
         msg_id = msg["id"]
         subject, content = get_email_content(service, msg_id)
 
@@ -261,9 +278,6 @@ def main():
         )
         if about_job:
             apply_label(service, msg_id, f"Jobs/{label}")
-
-        if idx % 100 == 0:
-            time.sleep(60)
 
     current_timestamp = datetime.now().timestamp()
     with open("last_executed_date.txt", "w") as f:
