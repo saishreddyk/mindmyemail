@@ -264,7 +264,7 @@ def main():
         )
         return
 
-    for msg in enumerate(emails):
+    for msg in emails:
         msg_id = msg["id"]
         subject, content = get_email_content(service, msg_id)
 
