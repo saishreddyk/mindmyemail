@@ -13,6 +13,7 @@ This Python application automatically classifies Gmail messages related to job a
 
 ## Impact
 It highlighted 2 missed interview calls, and ~5 missed online assessment invitations in the bulk of application emails.
+
 So, perhaps, the most life-changing project I ever setup.
 
 
