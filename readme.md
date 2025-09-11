@@ -52,7 +52,7 @@ uv venv
 uv install
 ```
 
-Run the script:
+Run the script (single account or all configured accounts):
 ```bash
 uv run python read_email.py
 ```
@@ -72,6 +72,23 @@ The script will:
 - `state.json`: Processing state (watermark + dedupe)
 - `last_executed_date.txt`: Legacy timestamp file (auto-bootstrapped if present)
 - `.env`: Environment variables
+
+## Multiple Accounts
+
+- Add an account (runs OAuth and saves a token under `accounts/<email>/token.json`):
+  ```bash
+  uv run python read_email.py --add-account
+  ```
+- Process all configured accounts (default behavior when `accounts/` exists):
+  ```bash
+  uv run python read_email.py
+  ```
+- Process a specific account:
+  ```bash
+  uv run python read_email.py --account you@example.com --account other@example.com
+  ```
+
+Per-account state is stored at `accounts/<email>/state.json`.
 
 ## Logging
 
