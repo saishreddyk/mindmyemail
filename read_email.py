@@ -11,6 +11,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+import argparse
 
 from logger_config import setup_logger
 import re
@@ -36,7 +37,7 @@ def _get_env_int(name: str, default: int) -> int:
         return default
 
 
-def load_state(backfill_days: int) -> dict:
+def load_state(backfill_days: int, state_path: str = STATE_PATH) -> dict:
     """Load processing state. Bootstrap from last_executed_date.txt if present.
 
     Returns a dict with keys:
@@ -45,9 +46,9 @@ def load_state(backfill_days: int) -> dict:
       - last_run_at: float|None
     """
     # Existing state.json
-    if os.path.exists(STATE_PATH):
+    if os.path.exists(state_path):
         try:
-            with open(STATE_PATH, "r") as f:
+            with open(state_path, "r") as f:
                 data = json.load(f)
             return {
                 "last_internal_ts": data.get("last_internal_ts"),
@@ -71,11 +72,11 @@ def load_state(backfill_days: int) -> dict:
     return {"last_internal_ts": None, "seen_ids": {}, "last_run_at": None}
 
 
-def save_state_atomic(state: dict):
-    tmp_path = STATE_PATH + ".tmp"
+def save_state_atomic(state: dict, state_path: str = STATE_PATH):
+    tmp_path = state_path + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(state, f)
-    os.replace(tmp_path, STATE_PATH)
+    os.replace(tmp_path, state_path)
 
 
 def prune_seen_ids(state: dict, lookback_seconds: int):
@@ -92,10 +93,10 @@ def prune_seen_ids(state: dict, lookback_seconds: int):
 
 
 # --- Authenticate and Build Gmail Service ---
-def authenticate_gmail():
+def authenticate_gmail(token_path: str = "token.json"):
     creds = None
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -111,7 +112,7 @@ def authenticate_gmail():
             creds = flow.run_local_server(port=0)
 
         # Save the credentials for the next run
-        with open("token.json", "w") as token:
+        with open(token_path, "w") as token:
             token.write(creds.to_json())
 
     return build("gmail", "v1", credentials=creds)
@@ -350,13 +351,14 @@ def format_timestamp(timestamp):
 
 
 # --- Main Function ---
-def main():
-    service = authenticate_gmail()
+def process_account(token_path: str, state_path: str, account_label: str):
+    logger.info(f"Processing account: {account_label}")
+    service = authenticate_gmail(token_path)
 
     backfill_days = _get_env_int("BACKFILL_DAYS", 14)
     lookback_seconds = _get_env_int("LOOKBACK_SECONDS", 2 * 24 * 60 * 60)  # 48h
 
-    state = load_state(backfill_days)
+    state = load_state(backfill_days, state_path)
     last_ts = state.get("last_internal_ts")
 
     if last_ts:
@@ -375,9 +377,8 @@ def main():
     logger.info(f"Found {len(emails)} emails after filtering by query start")
 
     if not emails:
-        # Save state update for last run
         state["last_run_at"] = datetime.now().timestamp()
-        save_state_atomic(state)
+        save_state_atomic(state, state_path)
         logger.info("No emails to process. State saved.")
         return
 
@@ -387,10 +388,8 @@ def main():
         msg_id = msg.get("id")
         internal_timestamp = int(msg.get("internalDate", msg.get("internal_date", 0))) / 1000
 
-        # Deduplicate by message id within lookback window
         if msg_id in seen_ids:
             logger.debug(f"Skipping already-seen message {msg_id}")
-            # Still move watermark forward if needed
             if not last_ts or internal_timestamp > last_ts:
                 state["last_internal_ts"] = internal_timestamp
                 last_ts = internal_timestamp
@@ -398,7 +397,6 @@ def main():
 
         subject, content = get_email_content(service, msg_id)
         if not content:
-            # Mark seen to avoid repeated fetching
             seen_ids[msg_id] = internal_timestamp
             if not last_ts or internal_timestamp > last_ts:
                 state["last_internal_ts"] = internal_timestamp
@@ -413,7 +411,6 @@ def main():
         if about_job:
             apply_label(service, msg_id, f"Jobs/{label}")
 
-        # Update watermark and seen ids
         seen_ids[msg_id] = internal_timestamp
         if not last_ts or internal_timestamp > last_ts:
             state["last_internal_ts"] = internal_timestamp
@@ -424,8 +421,68 @@ def main():
     state["last_run_at"] = datetime.now().timestamp()
 
     prune_seen_ids(state, lookback_seconds)
-    save_state_atomic(state)
+    save_state_atomic(state, state_path)
     logger.info(f"Processed {processed} messages. Watermark at {format_timestamp(last_ts)}. State saved.")
+
+
+def get_profile_email(service) -> str:
+    try:
+        prof = service.users().getProfile(userId="me").execute()
+        return prof.get("emailAddress") or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def add_account_flow():
+    flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+    creds = flow.run_local_server(port=0)
+    service = build("gmail", "v1", credentials=creds)
+    email = get_profile_email(service)
+
+    acct_dir = os.path.join("accounts", email)
+    os.makedirs(acct_dir, exist_ok=True)
+    token_path = os.path.join(acct_dir, "token.json")
+    with open(token_path, "w") as f:
+        f.write(creds.to_json())
+    logger.info(f"Added account: {email}. Token saved at {token_path}")
+
+
+def discover_accounts() -> list[str]:
+    accounts = []
+    base = "accounts"
+    if not os.path.isdir(base):
+        return accounts
+    for name in os.listdir(base):
+        token_path = os.path.join(base, name, "token.json")
+        if os.path.isfile(token_path):
+            accounts.append(name)
+    return accounts
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--add-account", action="store_true", help="Run OAuth to add a new Gmail account")
+    parser.add_argument("--account", action="append", help="Specific account email to process (can be repeated)")
+    args = parser.parse_args()
+
+    if args.add_account:
+        add_account_flow()
+        return
+
+    accounts = args.account if args.account else discover_accounts()
+
+    if not accounts:
+        # Fallback to single-account mode using root token/state
+        process_account("token.json", "state.json", account_label="default")
+        return
+
+    for email in accounts:
+        token_path = os.path.join("accounts", email, "token.json")
+        state_path = os.path.join("accounts", email, "state.json")
+        if not os.path.exists(token_path):
+            logger.error(f"Missing token for account {email}. Run with --add-account first.")
+            continue
+        process_account(token_path, state_path, account_label=email)
 
 
 if __name__ == "__main__":
