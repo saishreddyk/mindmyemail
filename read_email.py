@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import os.path
 import time
@@ -23,6 +24,71 @@ load_dotenv()
 # --- Configurations ---
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 openai.api_key = os.environ["OPENAI_API_KEY"]  # Replace with your OpenAI API Key
+
+# --- State management (Option A: watermark + dedupe) ---
+STATE_PATH = "state.json"
+
+
+def _get_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def load_state(backfill_days: int) -> dict:
+    """Load processing state. Bootstrap from last_executed_date.txt if present.
+
+    Returns a dict with keys:
+      - last_internal_ts: float|None
+      - seen_ids: dict[str, float]
+      - last_run_at: float|None
+    """
+    # Existing state.json
+    if os.path.exists(STATE_PATH):
+        try:
+            with open(STATE_PATH, "r") as f:
+                data = json.load(f)
+            return {
+                "last_internal_ts": data.get("last_internal_ts"),
+                "seen_ids": data.get("seen_ids", {}),
+                "last_run_at": data.get("last_run_at"),
+            }
+        except Exception:
+            logger.warning("Failed to read state.json; starting with fresh state")
+
+    # Bootstrap from legacy file if available
+    legacy_path = "last_executed_date.txt"
+    if os.path.exists(legacy_path):
+        try:
+            with open(legacy_path, "r") as f:
+                ts = float(f.read().strip())
+            return {"last_internal_ts": ts, "seen_ids": {}, "last_run_at": None}
+        except Exception:
+            logger.warning("Invalid legacy last_executed_date.txt; ignoring")
+
+    # Fresh state
+    return {"last_internal_ts": None, "seen_ids": {}, "last_run_at": None}
+
+
+def save_state_atomic(state: dict):
+    tmp_path = STATE_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp_path, STATE_PATH)
+
+
+def prune_seen_ids(state: dict, lookback_seconds: int):
+    last_ts = state.get("last_internal_ts")
+    if not last_ts:
+        return
+    cutoff = last_ts - lookback_seconds
+    seen = state.get("seen_ids", {})
+    pruned = {mid: ts for mid, ts in seen.items() if ts >= cutoff}
+    removed = len(seen) - len(pruned)
+    if removed:
+        logger.debug(f"Pruned {removed} seen_ids older than cutoff {format_timestamp(cutoff)}")
+    state["seen_ids"] = pruned
 
 
 # --- Authenticate and Build Gmail Service ---
@@ -278,18 +344,6 @@ def apply_label(service, msg_id, label_name):
     ).execute()
 
 
-def last_executed_timestamp():
-    try:
-        with open("last_executed_date.txt", "r") as f:
-            return float(f.read().strip())
-    except (FileNotFoundError, ValueError):
-        # Return current timestamp if file doesn't exist or has invalid format
-        logger.warning(
-            "File 'last_executed_date.txt' not found or invalid. Using current timestamp."
-        )
-        return datetime.now().timestamp()
-
-
 def format_timestamp(timestamp):
     """Convert timestamp to human readable format"""
     return datetime.fromtimestamp(timestamp).strftime("%Y/%m/%d %H:%M:%S")
@@ -298,30 +352,57 @@ def format_timestamp(timestamp):
 # --- Main Function ---
 def main():
     service = authenticate_gmail()
-    last_timestamp = last_executed_timestamp()
-    logger.info(
-        f"Starting email fetch. Last execution timestamp: {format_timestamp(last_timestamp)}"
-    )
 
-    emails = get_emails(service, last_timestamp)
-    logger.info(f"Found {len(emails)} new emails after timestamp filtering")
+    backfill_days = _get_env_int("BACKFILL_DAYS", 14)
+    lookback_seconds = _get_env_int("LOOKBACK_SECONDS", 2 * 24 * 60 * 60)  # 48h
+
+    state = load_state(backfill_days)
+    last_ts = state.get("last_internal_ts")
+
+    if last_ts:
+        query_start_ts = max(0, last_ts - lookback_seconds)
+        logger.info(
+            f"Starting fetch with cushion. Last watermark: {format_timestamp(last_ts)}; "
+            f"query start: {format_timestamp(query_start_ts)}"
+        )
+    else:
+        query_start_ts = datetime.now().timestamp() - backfill_days * 24 * 60 * 60
+        logger.info(
+            f"No prior watermark. Backfilling {backfill_days}d from: {format_timestamp(query_start_ts)}"
+        )
+
+    emails = get_emails(service, query_start_ts)
+    logger.info(f"Found {len(emails)} emails after filtering by query start")
 
     if not emails:
-        logger.info("No new unlabeled emails found.")
-        # Save current timestamp even if no emails found to prevent re-checking old emails
-        current_timestamp = datetime.now().timestamp()
-        with open("last_executed_date.txt", "w") as f:
-            f.write(str(current_timestamp))
-        logger.info(
-            f"Updated last executed timestamp to: {format_timestamp(current_timestamp)}"
-        )
+        # Save state update for last run
+        state["last_run_at"] = datetime.now().timestamp()
+        save_state_atomic(state)
+        logger.info("No emails to process. State saved.")
         return
 
+    seen_ids = state.get("seen_ids", {})
+    processed = 0
     for msg in emails:
-        msg_id = msg["id"]
-        subject, content = get_email_content(service, msg_id)
+        msg_id = msg.get("id")
+        internal_timestamp = int(msg.get("internalDate", msg.get("internal_date", 0))) / 1000
 
+        # Deduplicate by message id within lookback window
+        if msg_id in seen_ids:
+            logger.debug(f"Skipping already-seen message {msg_id}")
+            # Still move watermark forward if needed
+            if not last_ts or internal_timestamp > last_ts:
+                state["last_internal_ts"] = internal_timestamp
+                last_ts = internal_timestamp
+            continue
+
+        subject, content = get_email_content(service, msg_id)
         if not content:
+            # Mark seen to avoid repeated fetching
+            seen_ids[msg_id] = internal_timestamp
+            if not last_ts or internal_timestamp > last_ts:
+                state["last_internal_ts"] = internal_timestamp
+                last_ts = internal_timestamp
             continue
 
         about_job, label = analyze_email_with_llm(content)
@@ -332,13 +413,19 @@ def main():
         if about_job:
             apply_label(service, msg_id, f"Jobs/{label}")
 
-    current_timestamp = datetime.now().timestamp()
-    with open("last_executed_date.txt", "w") as f:
-        f.write(str(current_timestamp))
-    logger.info(
-        "Updating last executed date to: " + format_timestamp(current_timestamp)
-    )
-    logger.info("Program executed successfully.")
+        # Update watermark and seen ids
+        seen_ids[msg_id] = internal_timestamp
+        if not last_ts or internal_timestamp > last_ts:
+            state["last_internal_ts"] = internal_timestamp
+            last_ts = internal_timestamp
+        processed += 1
+
+    state["seen_ids"] = seen_ids
+    state["last_run_at"] = datetime.now().timestamp()
+
+    prune_seen_ids(state, lookback_seconds)
+    save_state_atomic(state)
+    logger.info(f"Processed {processed} messages. Watermark at {format_timestamp(last_ts)}. State saved.")
 
 
 if __name__ == "__main__":
