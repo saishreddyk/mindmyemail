@@ -59,17 +59,18 @@ uv run python read_email.py
 
 The script will:
 1. Authenticate with Gmail
-2. Fetch new emails since last execution
+2. Fetch emails from a safe lookback window
 3. Analyze each email using GPT
 4. Create and apply appropriate labels
-5. Update the last execution timestamp
+5. Update a robust processing state (watermark + dedupe)
 
 ## File Structure
 
 - `read_email.py`: Main script
 - `credentials.json`: Google OAuth credentials
 - `token.json`: Generated OAuth token
-- `last_executed_date.txt`: Timestamp of last execution
+- `state.json`: Processing state (watermark + dedupe)
+- `last_executed_date.txt`: Legacy timestamp file (auto-bootstrapped if present)
 - `.env`: Environment variables
 
 ## Logging
@@ -84,7 +85,18 @@ The application uses a configured logger that:
 - The script uses GPT-4-mini for email analysis
 - Email content is truncated to ~22000 characters for API limits
 - Labels are created hierarchically under "Jobs/" in Gmail
-- The script maintains state between runs using `last_executed_date.txt`
+- The script maintains state between runs using `state.json` (watermark + dedupe). It bootstraps from `last_executed_date.txt` if present.
+
+## State & Backfill
+
+- The script stores a high-watermark and a dedupe map in `state.json`:
+  - `last_internal_ts`: last seen Gmail `internalDate` (epoch seconds)
+  - `seen_ids`: recent message IDs with their timestamps (pruned to a lookback window)
+  - `last_run_at`: last run time (epoch seconds)
+- Lookback cushion and first-run backfill are configurable via `.env`:
+  - `LOOKBACK_SECONDS` (default: 172800 → 48 hours)
+  - `BACKFILL_DAYS` (default: 14)
+- First run without state uses a backfill from `now - BACKFILL_DAYS` and then filters precisely by `internalDate`.
 
 ## Security
 
