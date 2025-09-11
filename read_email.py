@@ -12,6 +12,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 from logger_config import setup_logger
+import re
+import html as htmllib
 
 # Setup logger
 logger = setup_logger(__name__)
@@ -112,26 +114,77 @@ def get_email_content(service, msg_id):
     )
     payload = message["payload"]
 
-    # Get subject from headers
+    # Extract subject
     subject = ""
-    for header in payload["headers"]:
-        if header["name"].lower() == "subject":
-            subject = header["value"]
+    for header in payload.get("headers", []):
+        if header.get("name", "").lower() == "subject":
+            subject = header.get("value", "")
             break
 
-    # Check if 'parts' exist
-    if "parts" in payload:
-        for part in payload["parts"]:
-            if part["mimeType"] == "text/plain":
-                data = part["body"]["data"]
-                text = base64.urlsafe_b64decode(data.encode("UTF-8")).decode("utf-8")
-                return subject, text
-    else:
-        # If 'parts' doesn't exist, check if 'body' has 'data'
-        if "body" in payload and "data" in payload["body"]:
-            data = payload["body"]["data"]
-            text = base64.urlsafe_b64decode(data.encode("UTF-8")).decode("utf-8")
-            return subject, text
+    def decode_part_data(data: str) -> str:
+        try:
+            # Gmail provides base64url; ensure bytes then decode
+            raw = base64.urlsafe_b64decode(data.encode("utf-8"))
+            return raw.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    def html_to_text(html: str) -> str:
+        if not html:
+            return ""
+        # Remove scripts/styles
+        text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\\1>", "", html)
+        # Line breaks for common block elements
+        text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+        text = re.sub(r"(?i)</p>", "\n\n", text)
+        text = re.sub(r"(?i)</div>", "\n", text)
+        text = re.sub(r"(?i)</li>", "\n", text)
+        # Strip remaining tags
+        text = re.sub(r"<[^>]+>", "", text)
+        # Unescape HTML entities
+        text = htmllib.unescape(text)
+        # Normalize whitespace
+        text = re.sub(r"\r\n|\r", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    def collect_texts(part, acc):
+        mime = part.get("mimeType", "")
+        body = part.get("body", {})
+        data = body.get("data")
+
+        # Recurse into subparts if present
+        if "parts" in part:
+            for p in part["parts"]:
+                collect_texts(p, acc)
+
+        # Some top-level payloads can have data directly
+        if data and mime:
+            if mime.startswith("text/plain"):
+                acc["plain"].append(decode_part_data(data))
+            elif mime.startswith("text/html"):
+                acc["html"].append(decode_part_data(data))
+
+    texts = {"plain": [], "html": []}
+    # Walk payload recursively
+    collect_texts(payload, texts)
+
+    # Fallbacks: prefer plain, else converted HTML, else try top-level body
+    if texts["plain"]:
+        return subject, "\n\n".join([t for t in texts["plain"] if t])
+    if texts["html"]:
+        html_joined = "\n\n".join([t for t in texts["html"] if t])
+        return subject, html_to_text(html_joined)
+
+    # Last resort: top-level body without parts
+    body = payload.get("body", {})
+    data = body.get("data")
+    if data:
+        mime = payload.get("mimeType", "")
+        raw = decode_part_data(data)
+        if mime.startswith("text/html"):
+            return subject, html_to_text(raw)
+        return subject, raw
 
     return subject, ""
 
